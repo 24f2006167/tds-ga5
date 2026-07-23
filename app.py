@@ -1,13 +1,5 @@
 """
-TDS GA5 — Unified FastAPI App  (v3 — Fully fixed Q8 + Q10 A2A 1.0)
-Q2  /prorate
-Q3  /q3/check
-Q4  /q4/scan
-Q5  /q5/check
-Q6  /mcp
-Q8  /q8/check
-Q9  /q9/mailroom
-Q10 /a2a/  (A2A 1.0 Protocol Compliant)
+TDS GA5 — Unified FastAPI App  (v4 — Fully fixed Q8 + Q10 A2A 1.0)
 """
 
 import asyncio
@@ -331,7 +323,7 @@ def _is_ssrf_value(val: str) -> bool:
         return (h not in Q8_ALLOWED_HOSTS) or _is_private(h)
     if _is_private(val):
         return True
-    if re.search(r"169\.254|metadata\.google|metadata\.internal|localhost", val, re.I):
+    if re.search(r"169\.254|metadata\.google|metadata\.internal|localhost|127\.0\.0\.1|0\.0\.0\.0", val, re.I):
         return True
     return False
 
@@ -346,7 +338,7 @@ async def q8_check(req: Request):
         raw_path = args.get("path") or args.get("file") or args.get("filepath") or ""
         root = _normpath(Q8_SANDBOX_ROOT)
 
-        # Resolve path accurately (handling relative vs absolute)
+        # Resolve path accurately
         if os.path.isabs(raw_path):
             norm = _normpath(raw_path)
         else:
@@ -389,10 +381,23 @@ async def q8_check(req: Request):
     if tool in ("fetch_url", "fetch", "http_request", "http", "network", "browse", "curl", "request", "web_search"):
         url = args.get("url") or args.get("uri") or args.get("link") or args.get("target") or args.get("endpoint") or ""
         
+        # Check userinfo confusion (e.g. http://user:pass@example.com)
+        if re.search(r"https?://[^/@]+@", url, re.I):
+            return {
+                "action": "block", "decision": "block",
+                "reason": "Userinfo-confused URL not allowed.", "result": None
+            }
+
         # Ensure scheme for proper urlparse
         url_to_parse = url if re.match(r"^https?://", url, re.I) else "http://" + url
         parsed = urlparse(url_to_parse)
         host = (parsed.hostname or "").lower()
+
+        if parsed.username or parsed.password:
+            return {
+                "action": "block", "decision": "block",
+                "reason": "Userinfo-confused URL not allowed.", "result": None
+            }
 
         if _is_private(host):
             return {
@@ -417,9 +422,16 @@ async def q8_check(req: Request):
 
         # Allowed — return safe content or fetch
         try:
-            async with httpx.AsyncClient(timeout=4) as client:
-                resp = await client.get(url_to_parse, follow_redirects=True,
-                                        headers={"User-Agent": "GA5-Guardrail/1.0"})
+            async with httpx.AsyncClient(timeout=4, follow_redirects=False) as client:
+                resp = await client.get(url_to_parse, headers={"User-Agent": "GA5-Guardrail/1.0"})
+                # Check redirect location for SSRF
+                if resp.is_redirect:
+                    loc = resp.headers.get("location", "")
+                    if _is_ssrf_value(loc):
+                        return {
+                            "action": "block", "decision": "block",
+                            "reason": "Redirect location is disallowed.", "result": None
+                        }
                 content = resp.text[:2048]
         except Exception:
             content = "<!doctype html><html><head><title>Example Domain</title></head><body><h1>Example Domain</h1></body></html>"
@@ -707,6 +719,21 @@ async def agent_card(req: Request):
     host = req.headers.get("host", str(req.url.hostname))
     base = f"{proto}://{host}/a2a/"
     
+    interface_def = {
+        "url":              base,
+        "protocolBinding":  "HTTP+JSON",
+        "protocolVersion":  "1.0",
+        "defaultInputModes":  [A2A_IN_BATCH],
+        "defaultOutputModes": [A2A_OUT_PROPS, A2A_OUT_RCPT],
+    }
+    skill_def = {
+        "id":          "invoice_action_agent",
+        "name":        "invoice_action_agent",
+        "description": "Reconciles invoice packages and proposes one typed action "
+                       "per package with cited evidence.",
+        "tags":        ["invoice", "a2a", "reconciliation", "finance"],
+    }
+    
     return Response(
         content=json.dumps({
             "name":        "GA5 Invoice Action Agent",
@@ -714,20 +741,14 @@ async def agent_card(req: Request):
                             "waits for grader results, and stores completed tasks.",
             "version":     "1.0",
             "url":         base,
+            "interfaces":  [interface_def],
+            "supportedInterfaces": [interface_def],
+            "skills":      [skill_def],
             "capabilities": {
-                "supportedInterfaces": [{
-                    "url":              base,
-                    "protocolBinding":  "HTTP+JSON",
-                    "protocolVersion":  "1.0",
-                    "defaultInputModes":  [A2A_IN_BATCH],
-                    "defaultOutputModes": [A2A_OUT_PROPS, A2A_OUT_RCPT],
-                }],
-                "skills": [{
-                    "name":        "invoice_action_agent",
-                    "description": "Reconciles invoice packages and proposes one typed action "
-                                   "per package with cited evidence.",
-                    "tags":        ["invoice", "a2a", "reconciliation", "finance"],
-                }],
+                "streaming": False,
+                "stateful": True,
+                "supportedInterfaces": [interface_def],
+                "skills": [skill_def],
             },
         }),
         media_type="application/json"
@@ -808,9 +829,7 @@ async def _handle_new_batch(principal, msg, msg_id, ctx_id, msg_hash, body):
 
 async def _handle_continuation(principal, msg, msg_id, task_id, ctx_id, result_parts, msg_hash):
     task = _A2A_TASKS[principal].get(task_id)
-    if not task:
-        raise HTTPException(404, "Task not found")
-    if task.get("metadata", {}).get("principal") != principal:
+    if not task or task.get("metadata", {}).get("principal") != principal:
         raise HTTPException(404, "Task not found")
 
     with _task_lock(task_id):
@@ -818,8 +837,12 @@ async def _handle_continuation(principal, msg, msg_id, task_id, ctx_id, result_p
         if ctx_id and task.get("contextId") and ctx_id != task.get("contextId"):
             return _a2a_resp({"error": "INVALID_CONTINUATION"}, status_code=400)
 
+        # Canceled task cannot accept continuations
+        if task["status"] == "TASK_STATE_CANCELED":
+            return _a2a_resp({"error": "Task already canceled"}, status_code=409)
+
         # Terminal state: replay stored task
-        if task["status"] in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED"):
+        if task["status"] in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"):
             _A2A_IDEM[principal][msg_id] = (msg_hash, task_id)
             return _a2a_resp({"task": task})
 
