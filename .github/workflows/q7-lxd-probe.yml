@@ -1,0 +1,87 @@
+name: Q7 LXD Sandbox Probe
+
+on:
+  workflow_dispatch:   # trigger manually from GitHub Actions tab
+
+jobs:
+  lxd-probe:
+    runs-on: ubuntu-22.04   # LXD works well on ubuntu-22.04 runners
+
+    steps:
+      # ── 1. Checkout so probe script is available ──────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── 2. Place canary file on the HOST (outside any container mount) ───
+      #    The container must NOT be able to read this path.
+      - name: Create host-side canary file
+        run: |
+          sudo mkdir -p /opt/tds-lxd-canary
+          printf 'TDS_LXD_CANARY_cb2493cd89c2885aefb6f1598a59640b570d1640' \
+            | sudo tee /opt/tds-lxd-canary/9ca6b445ab9d.txt
+          echo "Canary written:"
+          sudo cat /opt/tds-lxd-canary/9ca6b445ab9d.txt
+
+      # ── 3. Install + initialise LXD ──────────────────────────────────────
+      - name: Install LXD
+        run: |
+          sudo snap install lxd --channel=latest/stable
+          sudo lxd init --auto
+          sudo usermod -aG lxd runner
+          sudo lxd waitready --timeout 60
+          echo "LXD ready"
+
+      # ── 4. Launch sandbox container with all required limits ─────────────
+      - name: Launch sandbox container
+        run: |
+          sg lxd -c "lxc launch ubuntu:22.04 sandbox"
+          sleep 10    # wait for container to boot
+
+          # Memory hard limit (must trigger MemoryError in probe)
+          sg lxd -c "lxc config set sandbox limits.memory 1536MB"
+          sg lxd -c "lxc config set sandbox limits.memory.enforce hard"
+
+          # CPU limit
+          sg lxd -c "lxc config set sandbox limits.cpu 1"
+
+          # Remove network interface → container has no outbound network
+          sg lxd -c "lxc network detach lxdbr0 sandbox" || true
+
+          echo "Container config:"
+          sg lxd -c "lxc config show sandbox"
+
+      # ── 5. Push probe script into the container ──────────────────────────
+      - name: Copy probe script into container
+        run: |
+          sg lxd -c "lxc file push lxd-sandbox-probe.sh sandbox/root/probe.sh"
+          sg lxd -c "lxc exec sandbox -- chmod +x /root/probe.sh"
+
+      # ── 6. Run probe and capture combined stdout+stderr ──────────────────
+      - name: Run probe and capture log
+        run: |
+          sg lxd -c "lxc exec sandbox -- bash /root/probe.sh" \
+            > sandbox.log 2>&1 || true
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  FULL PROBE LOG (paste into exam box)"
+          echo "════════════════════════════════════════"
+          cat sandbox.log
+          echo ""
+          echo "════════════════════════════════════════"
+
+          # Quick validation
+          echo "── Checking required markers ──"
+          grep -q "LXD_SANDBOX_START"     sandbox.log && echo "✅ LXD_SANDBOX_START"     || echo "❌ LXD_SANDBOX_START MISSING"
+          grep -q "LXD_FS_BLOCKED"        sandbox.log && echo "✅ LXD_FS_BLOCKED"        || echo "❌ LXD_FS_BLOCKED MISSING"
+          grep -q "LXD_NET_ATTEMPT"       sandbox.log && echo "✅ LXD_NET_ATTEMPT"       || echo "❌ LXD_NET_ATTEMPT MISSING"
+          ! grep -q "LXD_NET_DONE status=0" sandbox.log && echo "✅ network blocked (no status=0)" || echo "❌ NETWORK LEAKED (status=0 present)"
+          grep -q "LXD_RESOURCE_LIMIT_HIT" sandbox.log && echo "✅ LXD_RESOURCE_LIMIT_HIT" || echo "❌ LXD_RESOURCE_LIMIT_HIT MISSING"
+          grep -q "LXD_SANDBOX_END"       sandbox.log && echo "✅ LXD_SANDBOX_END"       || echo "❌ LXD_SANDBOX_END MISSING"
+          ! grep -q "LXD_FS_LEAK"         sandbox.log && echo "✅ No canary leak"         || echo "❌ CANARY LEAKED"
+
+      # ── 7. Upload log as artifact so you can download it ─────────────────
+      - name: Upload sandbox log
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-log
+          path: sandbox.log
+          retention-days: 7
