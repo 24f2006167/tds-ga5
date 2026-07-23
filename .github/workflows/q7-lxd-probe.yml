@@ -36,8 +36,8 @@ jobs:
           sg lxd -c "lxc launch ubuntu:22.04 sandbox"
           sleep 10    # wait for container to boot
 
-          # Memory hard limit (must trigger MemoryError in probe)
-          sg lxd -c "lxc config set sandbox limits.memory 1536MB"
+      # Memory hard limit — set LOWER than 1536 MB so probe's allocation triggers MemoryError
+          sg lxd -c "lxc config set sandbox limits.memory 512MB"
           sg lxd -c "lxc config set sandbox limits.memory.enforce hard"
 
           # CPU limit
